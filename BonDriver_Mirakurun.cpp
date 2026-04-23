@@ -215,8 +215,23 @@ void CBonTuner::InitChannel()
 		picojson::object& channel_obj = g_Channel_JSON.get(i).get<picojson::object>();
 		const char *type;
 		if (g_Service_Split == 1) {
-			picojson::object& channel_detail = channel_obj["channel"].get<picojson::object>();
-			type = channel_detail["type"].get<std::string>().c_str();
+			if (channel_obj.count("channels") && channel_obj["channels"].is<picojson::array>()) {
+				picojson::array& chs = channel_obj["channels"].get<picojson::array>();
+				if (chs.empty() || !chs[0].is<picojson::object>()) {
+					i++;
+					continue;
+				}
+				picojson::object& ch0 = chs[0].get<picojson::object>();
+				type = ch0["type"].get<std::string>().c_str();
+			}
+			else if (channel_obj.count("channel") && channel_obj["channel"].is<picojson::object>()) {
+				picojson::object& channel_detail = channel_obj["channel"].get<picojson::object>();
+				type = channel_detail["type"].get<std::string>().c_str();
+			}
+			else {
+				i++;
+				continue;
+			}
 		}
 		else {
 			type = channel_obj["type"].get<std::string>().c_str();
@@ -802,14 +817,13 @@ const BOOL CBonTuner::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 
 	picojson::object& channel_obj = g_Channel_JSON.get(Bon_Channel).get<picojson::object>();
 
-	const char *type;
-	const char *channel;
-	char serviceId[6];
+	const char *type = NULL;
+	const char *channel = NULL;
+	unsigned long long serviceFullId = 0;
 	if (g_Service_Split == 1) {
-		picojson::object& channel_detail = channel_obj["channel"].get<picojson::object>();
-		type = channel_detail["type"].get<std::string>().c_str();
-		channel = channel_detail["channel"].get<std::string>().c_str();
-		sprintf_s(serviceId, "%u", (DWORD)channel_obj["serviceId"].get<double>());
+		// /api/services/{id}/stream を使うので必要なのはサービスの一意ID (最上位"id")のみ
+		// (物理チャンネルの選択はmirakurun側に委ねる)
+		serviceFullId = (unsigned long long)channel_obj["id"].get<double>();
 	}
 	else {
 		type = channel_obj["type"].get<std::string>().c_str();
@@ -832,12 +846,16 @@ const BOOL CBonTuner::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 	m_dwReadyReqNum = 0;
 
 	try{
-		char url[128];
-		char serverRequest[256];
+		char url[256];
+		char serverRequest[512];
 
 		// URL生成
 		if (g_Service_Split == 1) {
-			sprintf_s(url, "/api/channels/%s/%s/services/%s/stream?decode=%d", type, channel, serviceId, g_DecodeB25);
+			sprintf_s(url, "/api/services/%llu/stream?decode=%d", serviceFullId, g_DecodeB25);
+		}
+		else if (channel_obj.count("tsmfRelTs")) {
+			int tsmfRelTs = (int)channel_obj["tsmfRelTs"].get<double>();
+			sprintf_s(url, "/api/channels/%s/%s/stream?decode=%d&tsmfRelTs=%d", type, channel, g_DecodeB25, tsmfRelTs);
 		}
 		else {
 			sprintf_s(url, "/api/channels/%s/%s/stream?decode=%d", type, channel, g_DecodeB25);
@@ -983,22 +1001,87 @@ void CBonTuner::GetApiChannels(picojson::value* channel_json, int service_split)
 	picojson::value v;
 	std::string err = picojson::parse(v, response.content);
 	if (err.empty()) {
-		*channel_json = v;
-
-		/*
-		// DEBUG
-		picojson::array channel_array = v.get<picojson::array>();
-		for (picojson::array::iterator it = channel_array.begin(); it != channel_array.end(); it++) {
-			picojson::object& channel = it->get<picojson::object>();
-			std::string channel_name = channel["name"].get<std::string>();
-			picojson::array& services = channel["services"].get<picojson::array>();
-
-			std::string tmp_debug("channel name : ");
-			tmp_debug.append(channel_name);
-			wchar_t debug[128];
-			mbstowcs(debug, tmp_debug.c_str(), sizeof(debug));
-			OutputDebugString(debug);
+		// tsmfRelTsを持つチャンネルを展開
+		if (service_split == 0) {
+			ResolveTsmfChannels(&v);
 		}
-		*/
+		*channel_json = v;
 	}
+}
+
+void CBonTuner::ResolveTsmfChannels(picojson::value* channel_json)
+{
+	if (!channel_json->is<picojson::array>()) {
+		return;
+	}
+
+	picojson::array& channels = channel_json->get<picojson::array>();
+	picojson::array expanded;
+
+	for (picojson::array::iterator it = channels.begin(); it != channels.end(); it++) {
+		picojson::object& ch = it->get<picojson::object>();
+
+		// servicesが存在しtsmfRelTsを持つサービスがあるか確認
+		bool has_tsmf = false;
+		if (ch.count("services") && ch["services"].is<picojson::array>()) {
+			picojson::array& services = ch["services"].get<picojson::array>();
+			for (picojson::array::iterator sit = services.begin(); sit != services.end(); sit++) {
+				picojson::object& svc = sit->get<picojson::object>();
+				if (svc.count("tsmfRelTs")) {
+					has_tsmf = true;
+					break;
+				}
+			}
+		}
+
+		if (has_tsmf) {
+			picojson::array& services = ch["services"].get<picojson::array>();
+
+			// tsmfRelTsの一意な値を収集
+			int seen_tsmf[16];	// TSMF相対TS番号は4bit(0-15)
+			int seen_count = 0;
+			for (picojson::array::iterator sit = services.begin(); sit != services.end(); sit++) {
+				picojson::object& svc = sit->get<picojson::object>();
+				if (!svc.count("tsmfRelTs")) {
+					continue;
+				}
+				int tsmf_val = (int)svc["tsmfRelTs"].get<double>();
+				bool dup = false;
+				for (int k = 0; k < seen_count; k++) {
+					if (seen_tsmf[k] == tsmf_val) { dup = true; break; }
+				}
+				if (!dup && seen_count < 16) {
+					seen_tsmf[seen_count++] = tsmf_val;
+				}
+			}
+
+			// 1種類ならそのまま
+			if (seen_count <= 1) {
+				expanded.push_back(*it);
+			}
+			else {
+				std::string ch_type = ch["type"].get<std::string>();
+				std::string ch_channel = ch["channel"].get<std::string>();
+				std::string ch_name = ch["name"].get<std::string>();
+
+				for (int k = 0; k < seen_count; k++) {
+					char tsmf_str[32];
+					sprintf_s(tsmf_str, ".TS%d", seen_tsmf[k]);
+					std::string name = ch_name + tsmf_str;
+
+					picojson::object entry;
+					entry["type"] = picojson::value(ch_type);
+					entry["channel"] = picojson::value(ch_channel);
+					entry["name"] = picojson::value(name);
+					entry["tsmfRelTs"] = picojson::value((double)seen_tsmf[k]);
+					expanded.push_back(picojson::value(entry));
+				}
+			}
+		}
+		else {
+			expanded.push_back(*it);
+		}
+	}
+
+	*channel_json = picojson::value(expanded);
 }

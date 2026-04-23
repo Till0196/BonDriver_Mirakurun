@@ -140,6 +140,7 @@ protected:
 
 	void CalcBitRate();
 	void GetApiChannels(picojson::value *json_array, int service_split);
+	void ResolveTsmfChannels(picojson::value *channel_json);
 	DWORD m_dwRecvBytes;
 	DWORD m_dwLastCalcTick;
 	ULONGLONG m_u64RecvBytes;
